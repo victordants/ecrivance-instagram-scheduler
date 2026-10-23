@@ -1,0 +1,7 @@
+{
+  "name": "ecrivance-instagram-scheduler",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": { "run": "node run.mjs" }
+}

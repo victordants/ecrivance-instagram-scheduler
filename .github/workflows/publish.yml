@@ -1,0 +1,29 @@
+name: Publish scheduled Instagram posts
+on:
+  schedule:
+    - cron: "2 * * * *" # hourly; run.mjs decides what is due in Pacific time (slots 07/10/13/16/19)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only report what would be published"
+        type: boolean
+        default: true
+concurrency:
+  group: publish
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node run.mjs
+        env:
+          IG_TOKEN: ${{ secrets.IG_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '' }}
