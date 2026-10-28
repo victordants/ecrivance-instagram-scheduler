@@ -1,7 +1,11 @@
 name: Publish scheduled Instagram posts
 on:
   schedule:
-    - cron: "2 * * * *" # hourly; run.mjs decides what is due in Pacific time (slots 07/10/13/16/19)
+    # GitHub drops/delays scheduled runs (an hourly cron was firing only every 3–7 h). So we retry every 15 min,
+    # but only in 2-hour windows around the publish slots — 10:00, 13:00, 19:00 Pacific — covering both PDT (UTC-7)
+    # and PST (UTC-8). ~24 runs/day keeps the private repo inside the free Actions minutes. run.mjs publishes
+    # whatever is due today and catches up one older post per run, so one successful run per window is enough.
+    - cron: "4,19,34,49 17,18,20,21,2,3 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
