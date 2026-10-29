@@ -1,11 +1,11 @@
 name: Publish scheduled Instagram posts
 on:
   schedule:
-    # GitHub drops/delays scheduled runs (an hourly cron was firing only every 3–7 h). So we retry every 15 min,
-    # but only in 2-hour windows around the publish slots — 10:00, 13:00, 19:00 Pacific — covering both PDT (UTC-7)
-    # and PST (UTC-8). ~24 runs/day keeps the private repo inside the free Actions minutes. run.mjs publishes
-    # whatever is due today and catches up one older post per run, so one successful run per window is enough.
-    - cron: "4,19,34,49 17,18,20,21,2,3 * * *"
+    # GitHub's cron is best-effort (it fired 2 times in 24 h on 2026-10-29), so it no longer carries the timing.
+    # Each run stays up for WAIT_MINUTES publishing slots the minute they arrive, then dispatches the next run
+    # (a relay — workflow_dispatch from GITHUB_TOKEN is allowed to start new runs). These cron ticks only restart
+    # the relay if it ever breaks; while it runs they just queue behind it and get replaced (concurrency below).
+    - cron: "4,19,34,49 17,18,20,21,2,3 * * *" # windows around 10/13/19 Pacific (PDT+PST)
   workflow_dispatch:
     inputs:
       dry_run:
@@ -15,19 +15,34 @@ on:
 concurrency:
   group: publish
   cancel-in-progress: false
+permissions:
+  contents: read
+  actions: write
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: node run.mjs
+      # waiting is only free on a public repo; while private, behave like a plain cron run (no wait, no relay)
+      - id: run
+        run: |
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)" = "true" ]; then export WAIT_MINUTES=0; fi
+          node run.mjs
         env:
           IG_TOKEN: ${{ secrets.IG_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '' }}
+          WAIT_MINUTES: "330"
+          GH_TOKEN: ${{ github.token }}
+      # hand off even when a publish failed (the run is still red, so GitHub emails the owner)
+      - name: Hand off to the next run
+        if: always() && steps.run.outputs.relay == 'true'
+        run: gh workflow run publish.yml -R "$GITHUB_REPOSITORY" -f dry_run=false
+        env:
+          GH_TOKEN: ${{ github.token }}

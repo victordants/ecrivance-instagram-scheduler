@@ -1,8 +1,10 @@
-// Cloud publisher for @ecrivance. Runs hourly on GitHub Actions; publishes every scheduled post whose
-// Pacific-time slot has arrived. The schedule and media are pushed by marketing/instagram/scripts/cloud-sync.ts
-// in the app repo. No dependencies — Node 20 fetch only.
-//   DRY_RUN=1 node run.mjs   → print what would be published, touch nothing
-const { IG_TOKEN, IG_USER_ID, SUPABASE_URL, SUPABASE_KEY, DRY_RUN } = process.env;
+// Cloud publisher for @ecrivance on GitHub Actions; publishes every scheduled post whose Pacific-time slot has arrived.
+// The schedule and media are pushed by marketing/instagram/scripts/cloud-sync.ts in the app repo. No dependencies.
+// GitHub's cron fires hours late or not at all, so a run waits: with WAIT_MINUTES it stays up that long, publishing
+// each slot the minute it arrives, then the workflow dispatches the next run (a relay). The cron only restarts the relay.
+//   DRY_RUN=1 node run.mjs        → print what would be published, touch nothing
+//   WAIT_MINUTES=330 node run.mjs → publish what is due, then keep publishing slots as they arrive for 330 min
+const { IG_TOKEN, IG_USER_ID, SUPABASE_URL, SUPABASE_KEY, DRY_RUN, WAIT_MINUTES } = process.env;
 for (const [k, v] of Object.entries({ IG_TOKEN, IG_USER_ID, SUPABASE_URL, SUPABASE_KEY })) if (!v) throw new Error(`missing secret ${k}`);
 const dry = DRY_RUN === "1" || DRY_RUN === "true";
 const BUCKET = "instagram-media";
@@ -14,7 +16,8 @@ const say = (s) => (console.log(s), summary.push(s));
 
 // ── storage ──
 async function getJson(path, fallback) {
-  const r = await fetch(`${base}/storage/v1/object/${BUCKET}/${path}`, { headers: sbHeaders });
+  // cache-buster: storage reads right after a write can return a stale copy
+  const r = await fetch(`${base}/storage/v1/object/${BUCKET}/${path}?t=${Date.now()}`, { headers: sbHeaders, cache: "no-store" });
   return r.ok ? r.json() : fallback;
 }
 async function putJson(path, data) {
@@ -71,7 +74,8 @@ function pacificNow() {
 
 const firstLine = (s) => (s ?? "").split("\n")[0].trim();
 
-async function main() {
+/** One publishing pass. Returns the posts still open afterwards. */
+async function pass() {
   const now = pacificNow();
   const schedule = await getJson("schedule/schedule.json", []);
   const state = await getJson("schedule/state.json", { published: {} });
@@ -120,11 +124,51 @@ async function main() {
       say(`✗ ${p.id}: ${e.message}`);
     }
   }
+  return { open: schedule.filter((p) => !state.published[p.id]), failed };
+}
+
+const slotOf = (p) => `${p.date} ${p.time}`;
+
+async function main() {
+  const deadline = Date.now() + Number(WAIT_MINUTES || 0) * 60_000;
+  let { open, failed } = await pass();
+  // Relay: check every minute; re-read the schedule every 10 min (so a cloud-sync is picked up). A new slot arriving
+  // triggers a pass right away; leftovers (failures, older catch-ups) are retried at most every 15 min.
+  const dueIds = () => {
+    const now = pacificNow();
+    return open.filter((p) => slotOf(p) <= `${now.date} ${now.time}`).map((p) => p.id);
+  };
+  let seen = new Set(dueIds());
+  let lastPass = Date.now();
+  let checked = Date.now();
+  while (!dry && Date.now() < deadline) {
+    await sleep(Math.min(60_000, Math.max(0, deadline - Date.now())));
+    if (Date.now() - checked > 10 * 60_000) {
+      const schedule = await getJson("schedule/schedule.json", []);
+      const state = await getJson("schedule/state.json", { published: {} });
+      open = schedule.filter((p) => !state.published[p.id]);
+      checked = Date.now();
+    }
+    const due = dueIds();
+    if (due.some((id) => !seen.has(id)) || (due.length && Date.now() - lastPass > 15 * 60_000)) {
+      const r = await pass();
+      open = r.open;
+      failed += r.failed;
+      seen = new Set(dueIds());
+      lastPass = checked = Date.now();
+    }
+  }
+  const next = open.map(slotOf).sort()[0];
+  say(`${open.length} open${next ? ` · next ${next}` : ""}`);
+  if (process.env.GITHUB_OUTPUT) {
+    const { appendFileSync } = await import("node:fs");
+    appendFileSync(process.env.GITHUB_OUTPUT, `relay=${!dry && open.length > 0 && Number(WAIT_MINUTES || 0) > 0}\n`);
+  }
   if (process.env.GITHUB_STEP_SUMMARY) {
     const { appendFileSync } = await import("node:fs");
     appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary.map((s) => `- ${s}`).join("\n") + "\n");
   }
-  if (failed) process.exit(1); // red run → GitHub emails the owner
+  if (failed) process.exitCode = 1; // red run → GitHub emails the owner (the relay step still hands off)
 }
 
 main().catch((e) => {
